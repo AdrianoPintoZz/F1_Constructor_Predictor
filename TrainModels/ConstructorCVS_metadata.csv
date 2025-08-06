@@ -1,0 +1,19 @@
+Column Name,Description
+year,Year of the F1 season
+round,Race round number (cumulative data up to this round)
+total_rounds,Total number of rounds in this season
+season_progress,Progress through season (0.0 to 1.0)
+team,Constructor team name
+champion,Constructor champion of the season
+is_champion,"Binary indicator: 1 if this team is the champion, 0 otherwise"
+final_points,Final championship points for this team (end of season total)
+points,Total points accumulated by the team up to this round
+avg_grid_position,Average starting grid position across all races
+avg_finish_position,Average finishing position across all races
+positions_gained,Total positions gained/lost from grid to finish
+fastest_laps,Number of fastest laps achieved
+best_lap_time,Best lap time in seconds
+dnfs,Number of Did Not Finish results
+recovery_rate,Average positions gained/lost from grid to finish (positive = improvement)
+points_per_race,Average points scored per race
+reliability_rate,"Reliability rate (1 = perfect reliability, 0 = always DNF)"
