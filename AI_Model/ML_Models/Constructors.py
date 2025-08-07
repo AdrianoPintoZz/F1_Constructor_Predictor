@@ -6,7 +6,10 @@ from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 import os
 import warnings
-import fastf1
+import sys
+
+from fastf1 import get_session
+from fastf1.events import get_event_schedule
 warnings.filterwarnings('ignore')
 
 print("🏎️  F1 Constructor Championship Prediction Model")
@@ -196,6 +199,85 @@ print(f"🎯 Test accuracy: {test_accuracy:.3f}")
 print(f"\n📊 Classification Report:")
 print(classification_report(y_test, y_pred))
 
+def fetch_2025_data():
+    schedule = get_event_schedule(2025)
+    if schedule.empty:
+        print("⚠️ Nenhum evento disponível para 2025 na API FastF1.")
+        return None
+    data_2025 = []
+    total_rounds = schedule['RoundNumber'].max()
+    team_stats = {}
+    for _, event in schedule.iterrows():
+        round_num = event['RoundNumber']
+        try:
+            session = get_session(2025, round_num, 'R')
+            session.load()
+            results = session.results
+            teams = results['TeamName'].unique()
+            for team in teams:
+                if team not in team_stats:
+                    team_stats[team] = {
+                        'points': 0,
+                        'grid_positions': [],
+                        'finish_positions': [],
+                        'positions_gained': 0,
+                        'dnfs': 0,
+                        'races': 0
+                    }
+                team_results = results[results['TeamName'] == team]
+                team_stats[team]['points'] += team_results['Points'].sum()
+                grid_positions = team_results['GridPosition'].fillna(20)
+                finish_positions = team_results['Position'].fillna(20)
+                team_stats[team]['grid_positions'].extend(grid_positions.tolist())
+                team_stats[team]['finish_positions'].extend(finish_positions.tolist())
+                team_stats[team]['positions_gained'] += (grid_positions - finish_positions).sum()
+                team_stats[team]['dnfs'] += (team_results['Status'] != 'Finished').sum()
+                team_stats[team]['races'] += 1
+            for team in teams:
+                stats = team_stats[team]
+                races = stats['races'] if stats['races'] > 0 else 1
+                avg_grid_pos = np.mean(stats['grid_positions']) if stats['grid_positions'] else 20
+                avg_finish_pos = np.mean(stats['finish_positions']) if stats['finish_positions'] else 20
+                entry = {
+                    'year': 2025,
+                    'round': round_num,
+                    'total_rounds': total_rounds,
+                    'season_progress': round_num / total_rounds,
+                    'team': team,
+                    'champion': None,
+                    'is_champion': 0,
+                    'final_points': stats['points'],
+                    'points': stats['points'],
+                    'avg_grid_position': avg_grid_pos,
+                    'avg_finish_position': avg_finish_pos,
+                    'positions_gained': stats['positions_gained'],
+                    'fastest_laps': 0,
+                    'best_lap_time': 0,
+                    'dnfs': stats['dnfs'],
+                    'recovery_rate': avg_grid_pos - avg_finish_pos,
+                    'points_per_race': stats['points'] / races,
+                    'reliability_rate': 1 - (stats['dnfs'] / (races * 2))
+                }
+                data_2025.append(entry)
+        except Exception as e:
+            print(f"⚠️ Erro ao buscar dados do round {round_num} de 2025: {e}")
+            continue
+    df_2025 = pd.DataFrame(data_2025)
+    # Salva o CSV de 2025
+    trainmodels_dir = os.path.abspath(os.path.join(base_dir, '..', 'TrainModels'))
+    if not os.path.exists(trainmodels_dir):
+        os.makedirs(trainmodels_dir)
+    csv_2025_path = os.path.join(trainmodels_dir, 'constructor_2025_dataset.csv')
+    df_2025.to_csv(csv_2025_path, index=False)
+    print(f"✅ Dados de 2025 salvos em {csv_2025_path} ({df_2025.shape[0]} linhas)")
+    return df_2025
+
+# Adiciona ao DataFrame principal apenas se não houver dados de 2025
+if __name__ == "__main__":
+    # Gera e salva o CSV de 2025 ao rodar o script
+    fetch_2025_data()
+
+
 # Function to predict championship probabilities for each year
 def predict_championship_probabilities(year_data, model, scaler, le_team, feature_cols):
     """Predict championship probabilities for all teams in a given year"""
@@ -356,12 +438,26 @@ if len(high_confidence) > 0:
 print(f"\n💾 Model training completed successfully!")
 print(f"🏁 Ready to make predictions for future seasons!")
 
-# Prever 2025 com os dados existentes
-if 2025 in df['year'].unique():
-    print(f"\n🔮 Previsão para 2025:")
-    year_data_2025 = df[df['year'] == 2025].copy()
+# Prever 2025 com os dados do novo CSV
+csv_2025_path = os.path.abspath(os.path.join(base_dir, '..', 'TrainModels', 'constructor_2025_dataset.csv'))
+if os.path.exists(csv_2025_path):
+    print(f"\n🔮 Previsão para 2025 usando o novo CSV:")
+    df_2025 = pd.read_csv(csv_2025_path)
+    # Feature engineering for 2025 data
+    if 'team_encoded' not in df_2025.columns:
+        le_team_2025 = LabelEncoder()
+        df_2025['team_encoded'] = le_team_2025.fit_transform(df_2025['team'])
+    else:
+        le_team_2025 = le_team
+    # Add missing features with default values if needed
+    for col in feature_columns:
+        if col not in df_2025.columns:
+            df_2025[col] = 0.0
+        else:
+            df_2025[col] = df_2025[col].fillna(df_2025[col].median())
+    # Predict using last round for each team
     predictions_2025 = predict_championship_probabilities(
-        year_data_2025, rf_model, scaler, le_team, feature_columns
+        df_2025, rf_model, scaler, le_team_2025, feature_columns
     )
     print(f"\n🎯 Probabilidades de campeonato para 2025:")
     for _, row in predictions_2025.iterrows():
@@ -374,61 +470,6 @@ if 2025 in df['year'].unique():
     predicted_champion_2025 = predictions_2025.loc[predictions_2025['predicted_champion'], 'team'].iloc[0]
     print(f"\n🤖 Campeão previsto para 2025: {predicted_champion_2025}")
 else:
-    print("\n⚠️  Não há dados para 2025 no dataset!")
+    print(f"\n⚠️  O arquivo de dados para 2025 não foi encontrado em {csv_2025_path}!")
 
-def fetch_2025_data():
-    import fastf1
-    from fastf1 import get_session
-    import pandas as pd
-    # Corrigido: usar fastf1.events.get_event para obter eventos
-    from fastf1.events import get_event_schedule
-    schedule = get_event_schedule(2025)
-    if schedule.empty:
-        print("⚠️ Nenhum evento disponível para 2025 na API FastF1.")
-        return pd.DataFrame()
-    last_event = schedule.iloc[-1]
-    round_num = last_event['RoundNumber']
-    session = get_session(2025, round_num, 'R')
-    session.load()
-    results = session.results
-    teams = results['TeamName'].unique()
-    data_2025 = []
-    for team in teams:
-        team_results = results[results['TeamName'] == team]
-        points = team_results['Points'].sum()
-        grid_positions = team_results['GridPosition'].fillna(20)
-        finish_positions = team_results['Position'].fillna(20)
-        avg_grid_pos = grid_positions.mean()
-        avg_finish_pos = finish_positions.mean()
-        positions_gained = (grid_positions - finish_positions).sum()
-        dnfs = (team_results['Status'] != 'Finished').sum()
-        entry = {
-            'year': 2025,
-            'round': round_num,
-            'total_rounds': round_num,
-            'season_progress': round_num / round_num,
-            'team': team,
-            'champion': None,
-            'is_champion': 0,
-            'final_points': points,
-            'points': points,
-            'avg_grid_position': avg_grid_pos,
-            'avg_finish_position': avg_finish_pos,
-            'positions_gained': positions_gained,
-            'fastest_laps': 0,
-            'best_lap_time': 0,
-            'dnfs': dnfs,
-            'recovery_rate': avg_grid_pos - avg_finish_pos,
-            'points_per_race': points,
-            'reliability_rate': 1 - (dnfs / 2)
-        }
-        data_2025.append(entry)
-    df_2025 = pd.DataFrame(data_2025)
-    return df_2025
-
-# Adiciona ao DataFrame principal apenas se não houver dados de 2025
-if 2025 not in df['year'].unique():
-    df_2025 = fetch_2025_data()
-    if not df_2025.empty:
-        df = pd.concat([df, df_2025], ignore_index=True)
 
