@@ -199,7 +199,26 @@ print(f"🎯 Test accuracy: {test_accuracy:.3f}")
 print(f"\n📊 Classification Report:")
 print(classification_report(y_test, y_pred))
 
-def fetch_2025_data():
+def fetch_2025_data(force_refresh: bool = False):
+    """Fetch 2025 data from FastF1 API and cache to CSV.
+
+    If the CSV already exists and force_refresh is False, reuse it and skip the API.
+    """
+    # CSV cache path (kept consistent with the path used later for reading)
+    trainmodels_dir = os.path.abspath(os.path.join(base_dir, '..', 'TrainModels'))
+    if not os.path.exists(trainmodels_dir):
+        os.makedirs(trainmodels_dir)
+    csv_2025_path = os.path.join(trainmodels_dir, 'constructor_2025_dataset.csv')
+
+    # If cache exists and we aren't forcing a refresh, reuse it
+    if (not force_refresh) and os.path.exists(csv_2025_path):
+        try:
+            cached_df = pd.read_csv(csv_2025_path)
+            print(f"📦 Usando CSV 2025 já existente: {csv_2025_path} ({cached_df.shape[0]} linhas)")
+            return cached_df
+        except Exception as e:
+            print(f"⚠️ Falha ao ler CSV existente ({csv_2025_path}). Tentando buscar via API... Detalhes: {e}")
+
     schedule = get_event_schedule(2025)
     if schedule.empty:
         print("⚠️ Nenhum evento disponível para 2025 na API FastF1.")
@@ -264,18 +283,24 @@ def fetch_2025_data():
             continue
     df_2025 = pd.DataFrame(data_2025)
     # Salva o CSV de 2025
-    trainmodels_dir = os.path.abspath(os.path.join(base_dir, '..', 'TrainModels'))
-    if not os.path.exists(trainmodels_dir):
-        os.makedirs(trainmodels_dir)
-    csv_2025_path = os.path.join(trainmodels_dir, 'constructor_2025_dataset.csv')
     df_2025.to_csv(csv_2025_path, index=False)
     print(f"✅ Dados de 2025 salvos em {csv_2025_path} ({df_2025.shape[0]} linhas)")
     return df_2025
 
 # Adiciona ao DataFrame principal apenas se não houver dados de 2025
 if __name__ == "__main__":
-    # Gera e salva o CSV de 2025 ao rodar o script
-    fetch_2025_data()
+    # Gera e salva o CSV de 2025 apenas se não existir (usa cache caso exista)
+    tm_dir = os.path.abspath(os.path.join(base_dir, '..', 'TrainModels'))
+    csv_2025_path_main = os.path.join(tm_dir, 'constructor_2025_dataset.csv')
+    if os.path.exists(csv_2025_path_main):
+        try:
+            df_cached = pd.read_csv(csv_2025_path_main)
+            print(f"📦 CSV 2025 já existe: {csv_2025_path_main} ({df_cached.shape[0]} linhas). Pulando fetch da API.")
+        except Exception as e:
+            print(f"⚠️ CSV 2025 existe mas não pôde ser lido. Tentando refazer via API... Detalhes: {e}")
+            fetch_2025_data(force_refresh=True)
+    else:
+        fetch_2025_data()
 
 
 # Function to predict championship probabilities for each year
