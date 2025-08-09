@@ -199,6 +199,71 @@ print(f"🎯 Test accuracy: {test_accuracy:.3f}")
 print(f"\n📊 Classification Report:")
 print(classification_report(y_test, y_pred))
 
+# Helper: compute engineered features on a dataset that has the base columns
+def compute_engineered_features(df_in: pd.DataFrame) -> pd.DataFrame:
+    df_feat = df_in.copy()
+    # Ensure required base columns exist
+    base_needed = [
+        'year', 'round', 'team', 'final_points', 'points',
+        'avg_grid_position', 'avg_finish_position', 'points_per_race',
+        'reliability_rate'
+    ]
+    for col in base_needed:
+        if col not in df_feat.columns:
+            # Provide neutral defaults to avoid NaNs
+            if col in ['year', 'round']:
+                df_feat[col] = 0
+            elif col == 'team':
+                df_feat[col] = 'Unknown'
+            else:
+                df_feat[col] = 0.0
+
+    # 1. Consistency metrics
+    df_feat['grid_consistency'] = df_feat.groupby(['year', 'team'])['avg_grid_position'].transform('std').fillna(0)
+    df_feat['finish_consistency'] = df_feat.groupby(['year', 'team'])['avg_finish_position'].transform('std').fillna(0)
+    df_feat['points_consistency'] = df_feat.groupby(['year', 'team'])['points_per_race'].transform('std').fillna(0)
+    df_feat['consistency_score'] = 1 / (1 + df_feat['grid_consistency'] + df_feat['finish_consistency'] + df_feat['points_consistency'])
+
+    # 2. Performance trend
+    df_feat['points_trend'] = df_feat.groupby(['year', 'team'])['points'].diff().fillna(0)
+    df_feat['position_improvement'] = df_feat.groupby(['year', 'team'])['avg_finish_position'].diff().fillna(0) * -1
+
+    # 3. Elite performance indicators
+    df_feat['top3_rate'] = np.where(df_feat['avg_finish_position'] <= 3, 1, 0)
+    df_feat['podium_consistency'] = df_feat.groupby(['year', 'team'])['top3_rate'].transform('mean').fillna(0)
+
+    # 4. Competitive advantage metrics
+    df_feat['points_dominance'] = df_feat['points_per_race'] / (df_feat.groupby(['year', 'round'])['points_per_race'].transform('mean') + 1)
+    df_feat['grid_advantage'] = 20 - df_feat['avg_grid_position']
+    df_feat['race_advantage'] = 20 - df_feat['avg_finish_position']
+
+    # 5. Advanced performance ratios
+    df_feat['grid_to_finish_ratio'] = df_feat['avg_grid_position'] / (df_feat['avg_finish_position'] + 1)
+    df_feat['points_efficiency'] = df_feat['points_per_race'] / (21 - df_feat['avg_finish_position'])
+
+    # 6. Season progression
+    if 'total_rounds' in df_feat.columns and (df_feat['total_rounds'] > 0).any():
+        df_feat['season_progress'] = df_feat['round'] / df_feat['total_rounds'].replace(0, np.nan)
+        df_feat['season_progress'] = df_feat['season_progress'].fillna(0)
+    else:
+        df_feat['season_progress'] = df_feat['round'] / 24.0
+    df_feat['late_season_performance'] = np.where(df_feat['round'] >= 15, df_feat['points_per_race'] * 1.5, df_feat['points_per_race'])
+    df_feat['championship_momentum'] = df_feat.groupby(['year', 'team'])['points_per_race'].transform(lambda x: x.rolling(3, min_periods=1).mean())
+
+    # 7. Contender flag and title score
+    rr_mean = df_feat.groupby(['year', 'round'])['points_per_race'].transform('quantile', 0.7)
+    df_feat['championship_contender'] = np.where(df_feat['points_per_race'] > rr_mean, 1, 0)
+    df_feat['title_fight_score'] = df_feat['points_per_race'] * df_feat['consistency_score'] * (1 + df_feat['season_progress'])
+
+    # Final NA cleanup for model features
+    for col in feature_columns:
+        if col not in df_feat.columns:
+            df_feat[col] = 0.0
+        else:
+            df_feat[col] = df_feat[col].fillna(df_feat[col].median())
+
+    return df_feat
+
 def fetch_2025_data(force_refresh: bool = False):
     """Fetch 2025 data from FastF1 API and cache to CSV.
 
@@ -319,12 +384,28 @@ def predict_championship_probabilities(year_data, model, scaler, le_team, featur
         suffixes=('', '_real')
     )
 
-    # Fill missing final_points with model prediction if not available
-    if 'final_points' in final_round_data.columns:
-        final_round_data['final_points'] = final_round_data['final_points'].fillna(final_round_data['points'])
+    # Preferir pontos finais reais do standings, depois existentes, depois pontos acumulados
+    if 'final_points_real' in final_round_data.columns:
+        # Usa final_points_real quando disponível; senão mantém o existente; senão usa 'points'
+        existing_fp = final_round_data['final_points'] if 'final_points' in final_round_data.columns else np.nan
+        final_round_data['final_points'] = (
+            final_round_data['final_points_real']
+            .combine_first(existing_fp)
+            .fillna(final_round_data['points'])
+        )
+    else:
+        if 'final_points' in final_round_data.columns:
+            final_round_data['final_points'] = final_round_data['final_points'].fillna(final_round_data['points'])
 
     # Prepare features
-    final_round_data['team_encoded'] = le_team.transform(final_round_data['team'])
+    # Safe team encoding: map known classes; unseen teams go to a reserved code (max+1)
+    try:
+        known_classes = list(getattr(le_team, 'classes_', []))
+    except Exception:
+        known_classes = []
+    mapping = {cls: idx for idx, cls in enumerate(known_classes)}
+    reserved_code = (max(mapping.values()) + 1) if mapping else 0
+    final_round_data['team_encoded'] = final_round_data['team'].map(mapping).fillna(reserved_code).astype(int)
     X_year = final_round_data[feature_cols]
     X_year_scaled = scaler.transform(X_year)
 
@@ -338,35 +419,118 @@ def predict_championship_probabilities(year_data, model, scaler, le_team, featur
     diff_ratio = 1.0 - min(diff_points / (max_points + 1e-8), 1.0)
 
     try:
-        # Get raw probabilities from the model
+        # Probabilidades do modelo
         probabilities = model.predict_proba(X_year_scaled)
-        raw_probs = probabilities[:, 1] if probabilities.shape[1] > 1 else probabilities[:, 0]
+        ml_probs = probabilities[:, 1] if probabilities.shape[1] > 1 else probabilities[:, 0]
 
-        # Normalize title_fight_score
-        performance_weights = final_round_data['title_fight_score'].values
-        performance_weights = performance_weights / (performance_weights.sum() + 1e-8)
+        # Converte para logits e normaliza (evita saturação)
+        ml_probs = np.clip(ml_probs, 1e-6, 1 - 1e-6)
+        ml_logits = np.log(ml_probs / (1 - ml_probs))
+        def _zscore(x: np.ndarray) -> np.ndarray:
+            x = x.astype(float)
+            return (x - x.mean()) / (x.std() + 1e-6)
 
-        # Combine com pesos mais realistas (85% modelo, 15% performance)
-        combined_scores = (raw_probs * 0.85) + (performance_weights * 0.15)
+        ml_component = _zscore(ml_logits)
 
-        # Temperatura dinâmica: se disputa equilibrada, temperatura menor (probabilidades mais próximas)
-        base_temp = 1.0
-        temp_range = 1.5
-        temperature = base_temp + temp_range * (1.0 - diff_ratio)
-        exp_scores = np.exp(combined_scores * temperature)
-        champion_probs = exp_scores / np.sum(exp_scores)
+        # Prior baseado em performance (pontos finais preferencialmente; se não, points_per_race)
+        eps = 1e-8
+        fp_arr = final_round_data['final_points'].to_numpy(dtype=float)
+        ppr_arr = final_round_data['points_per_race'].to_numpy(dtype=float) if 'points_per_race' in final_round_data.columns else np.zeros_like(fp_arr)
+        if fp_arr.sum() > 0:
+            prior_base = fp_arr
+        elif ppr_arr.sum() > 0:
+            prior_base = ppr_arr
+        else:
+            prior_base = np.ones_like(fp_arr)
+        prior_norm = prior_base / (prior_base.sum() + eps)
 
-        # Mistura ponderada dos dois primeiros colocados se disputa for muito equilibrada
-        if diff_ratio > 0.6:
-            idx_top1 = champion_probs.argmax()
-            idx_top2 = np.argsort(-champion_probs)[1]
-            prob_top1 = champion_probs[idx_top1]
-            prob_top2 = champion_probs[idx_top2]
-            total = prob_top1 + prob_top2
-            champion_probs[idx_top1] = total * 0.65
-            champion_probs[idx_top2] = total * 0.35
-            # Renormaliza para somar 1
-            champion_probs = champion_probs / champion_probs.sum()
+        # Peso dinâmico do prior cresce ao longo da temporada; também acentua separação com potência
+        if 'season_progress' in final_round_data.columns:
+            season_prog_mean = float(final_round_data['season_progress'].mean())
+        else:
+            # fallback: usa round/24
+            season_prog_mean = float((final_round_data['round'].max() or 0) / 24.0)
+        season_prog_mean = max(0.0, min(1.0, season_prog_mean))
+
+        # Detecta se os pontos finais são "reais" (vindos do standings) ou apenas acumulados até o momento
+        has_real_final_points = 'final_points_real' in final_round_data.columns and final_round_data['final_points_real'].notna().any()
+
+        # Ajusta progressão efetiva: se não temos pontos finais reais (dados em curso), reduza convicção
+        effective_prog = season_prog_mean if has_real_final_points else season_prog_mean * 0.75
+
+        # Potência do prior: mais baixa quando temporada não finalizada
+        # ~1.0 (início) a ~2.2 (fim) quando não-final; ~1.2 a ~2.6 quando final
+        if has_real_final_points:
+            gamma = 1.2 + 1.4 * effective_prog
+        else:
+            gamma = 1.0 + 1.2 * effective_prog
+        prior_scores = np.power(prior_norm + eps, gamma)
+        prior_scores = prior_scores / (prior_scores.sum() + eps)
+        prior_component = _zscore(np.log(prior_scores + eps))
+
+        # Combinação: no início, dá mais peso ao modelo; no fim, mais ao prior de pontos
+        if has_real_final_points:
+            w_prior = 0.25 + 0.55 * effective_prog   # 0.25 -> 0.80
+        else:
+            w_prior = 0.20 + 0.40 * effective_prog   # 0.20 -> 0.60 (mais conservador)
+        w_prior = float(max(0.0, min(0.95, w_prior)))
+        w_ml = 1.0 - w_prior
+        combined = (w_ml * ml_component) + (w_prior * prior_component)
+
+        # Sharpening com base na vantagem em pontos (maior vantagem => mais nítido)
+        gap_ratio = float(diff_points / (max_points + eps)) if (max_points + eps) > 0 else 0.0
+        if has_real_final_points:
+            # Final de temporada: evitar picos exagerados mesmo com grande gap
+            tau = 1.30 + 2.00 * gap_ratio  # até ~3.30 antes do cap
+        else:
+            # Temporada em curso: ainda mais suave
+            tau = 1.30 + 2.00 * gap_ratio  # até ~3.30 antes do cap
+        tau = float(max(1.02, min(2.8 if has_real_final_points else 3.2, tau)))
+        exp_scores = np.exp(combined * tau)
+        champion_probs = exp_scores / (exp_scores.sum() + eps)
+
+        # Mistura com uma distribuição uniforme quando a temporada ainda não está madura
+        # Reduz confiança excessiva em dados em curso (ex.: 2025 parcial)
+        if not has_real_final_points:
+            k = len(champion_probs)
+            # Use distribuição baseada em pontos (prior_scores) para preservar separação
+            prior_dist = prior_scores.astype(float)
+            prior_dist = prior_dist / (prior_dist.sum() + eps)
+            # incerteza decai linearmente até 0 por volta de 60% da temporada
+            uncertainty = float(max(0.0, 0.6 - effective_prog) / 0.6)
+            blend_alpha = 0.50 * uncertainty  # até 50% de mistura no começo
+            champion_probs = (1.0 - blend_alpha) * champion_probs + blend_alpha * prior_dist
+            champion_probs = champion_probs / (champion_probs.sum() + eps)
+
+            # Garantir que o topo não ultrapasse um teto dinâmico em temporada em curso
+            top = float(champion_probs.max())
+            max_top_allowed = 0.60 + 0.20 * effective_prog  # 60% no início -> 80% mais tarde
+            if top > max_top_allowed:
+                alpha_extra = float(min(0.7, (top - max_top_allowed) * 1.8))
+                champion_probs = (1.0 - alpha_extra) * champion_probs + alpha_extra * prior_dist
+                champion_probs = champion_probs / (champion_probs.sum() + eps)
+        else:
+            # Temporada finalizada: pequena suavização para evitar 98%+
+            k = len(champion_probs)
+            if k > 1:
+                uniform = np.ones(k, dtype=float) / k
+                blend_alpha_final = 0.08
+                champion_probs = (1.0 - blend_alpha_final) * champion_probs + blend_alpha_final * uniform
+                champion_probs = champion_probs / (champion_probs.sum() + eps)
+
+            # Limite suave para prob máxima em temporada finalizada baseado no gap
+            top = float(champion_probs.max())
+            max_top_allowed_final = 0.70 + 0.25 * float(min(1.0, max(0.0, gap_ratio)))  # 70% -> 95% (teórico)
+            max_top_allowed_final = float(min(0.90, max_top_allowed_final))  # teto absoluto 90%
+            if top > max_top_allowed_final and k > 1:
+                alpha_extra_final = float(min(0.5, (top - max_top_allowed_final) * 1.5))
+                champion_probs = (1.0 - alpha_extra_final) * champion_probs + alpha_extra_final * uniform
+        champion_probs = champion_probs / (champion_probs.sum() + eps)
+
+        # Piso mínimo para evitar quase-uniforme em times sem chance e renormalização
+        floor = 0.001
+        champion_probs = np.maximum(champion_probs, floor)
+        champion_probs = champion_probs / champion_probs.sum()
 
     except Exception as e:
         print(f"⚠️  Prediction error: {e}")
@@ -468,18 +632,10 @@ csv_2025_path = os.path.abspath(os.path.join(base_dir, '..', 'TrainModels', 'con
 if os.path.exists(csv_2025_path):
     print(f"\n🔮 Previsão para 2025 usando o novo CSV:")
     df_2025 = pd.read_csv(csv_2025_path)
-    # Feature engineering for 2025 data
-    if 'team_encoded' not in df_2025.columns:
-        le_team_2025 = LabelEncoder()
-        df_2025['team_encoded'] = le_team_2025.fit_transform(df_2025['team'])
-    else:
-        le_team_2025 = le_team
-    # Add missing features with default values if needed
-    for col in feature_columns:
-        if col not in df_2025.columns:
-            df_2025[col] = 0.0
-        else:
-            df_2025[col] = df_2025[col].fillna(df_2025[col].median())
+    # Compute engineered features for 2025 data to avoid zeros and uniform outputs
+    df_2025 = compute_engineered_features(df_2025)
+    # Use training label encoder; unseen teams handled inside predictor via safe mapping
+    le_team_2025 = le_team
     # Predict using last round for each team
     predictions_2025 = predict_championship_probabilities(
         df_2025, rf_model, scaler, le_team_2025, feature_columns
